@@ -39,13 +39,25 @@ async def ping(interaction: discord.Interaction):
 @client.tree.command(name="serverinfo", description="Get information about the server")
 async def serverinfo(interaction: discord.Interaction):
     guild = interaction.guild
+    
+    # Get owner info safely
+    owner = "Unknown"
+    if guild.owner:
+        owner = guild.owner.mention
+    elif guild.owner_id:
+        owner = f"<@{guild.owner_id}>"
+
     embed = discord.Embed(
         title=f"📊 {guild.name} Info",
         color=discord.Color.blue(),
         timestamp=datetime.datetime.now()
     )
-    embed.set_thumbnail(url=guild.icon.url if guild.icon else None)
-    embed.add_field(name="Owner", value=guild.owner.mention, inline=True)
+    
+    # Set thumbnail safely
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+        
+    embed.add_field(name="Owner", value=owner, inline=True)
     embed.add_field(name="Created On", value=guild.created_at.strftime("%Y-%m-%d"), inline=True)
     embed.add_field(name="Member Count", value=guild.member_count, inline=True)
     embed.add_field(name="Boost Level", value=f"Level {guild.premium_tier}", inline=True)
