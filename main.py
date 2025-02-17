@@ -15,6 +15,7 @@ import base64
 from PIL import Image
 import logging
 from openai import OpenAI
+import time
 
 # Load environment variables
 load_dotenv()
@@ -43,6 +44,18 @@ class Player:
         self.successful_choices = 0
         self.damage_taken = 0
         self.highest_risk_survived = 0
+        self.consecutive_failures = 0
+        self.scenes_completed = 0
+        self.character_type = None
+        self.inventory = []
+        self.story_context = {
+            "main_quest": None,
+            "current_goal": None,
+            "character_background": None,
+            "acquired_items": [],
+            "lost_items": [],
+            "notable_events": []
+        }
 
 class AdventureGame:
     def __init__(self):
@@ -146,7 +159,7 @@ class AdventureGame:
                 "17": {
                     "inputs": {
                         "scheduler": "simple",
-                        "steps": 20,
+                        "steps": 15,
                         "denoise": 1,
                         "model": ["61", 0]
                     },
@@ -184,13 +197,13 @@ class AdventureGame:
                 },
                 "70": {
                     "inputs": {
-                        "int": 1024
+                        "int": 512
                     },
                     "class_type": "Int Literal"
                 },
                 "71": {
                     "inputs": {
-                        "int": 1024
+                        "int": 512
                     },
                     "class_type": "Int Literal"
                 },
@@ -376,6 +389,23 @@ class AdventureGame:
             logger.error(f"Error generating location: {e}")
             return None
 
+    async def start_game(self, interaction: discord.Interaction):
+        player = self.get_player(interaction.user.id)
+        player.character_type = random.choice([
+            "bounty hunter",
+            "escaped prisoner",
+            "cyber mercenary",
+            "rogue hacker",
+            "street fighter"
+        ])
+        player.story_context["main_quest"] = {
+            "bounty hunter": "tracking a dangerous criminal",
+            "escaped prisoner": "finding freedom in the wasteland",
+            "cyber mercenary": "completing a high-stakes contract",
+            "rogue hacker": "exposing corporate corruption",
+            "street fighter": "becoming the underground champion"
+        }[player.character_type]
+
 class AdventureView(discord.ui.View):
     def __init__(self, game: AdventureGame, player: Player):
         super().__init__(timeout=None)
@@ -402,60 +432,66 @@ class AdventureView(discord.ui.View):
             self.add_item(button)
 
     async def button_callback(self, interaction: discord.Interaction):
-        clicked_button = interaction.data['custom_id']
+        start_time = time.time()
+        logger.info(f"Button pressed: {interaction.data['custom_id']}")
         
+        clicked_button = interaction.data['custom_id']
         for item in self.children:
             if item.custom_id == clicked_button:
                 item.style = discord.ButtonStyle.success
-                
-        path_id = clicked_button.replace('path_', '')
+                item.disabled = True
+            else:
+                item.disabled = True
+        
         location = self.game.locations.get(self.player.location)
-        path_info = next((p for p in location["paths"] if p["target_id"] == path_id), None)
+        path_info = next((p for p in location["paths"] if p["target_id"] == clicked_button.replace('path_', '')), None)
         
         if not path_info:
+            logger.error(f"Path not found for ID: {clicked_button.replace('path_', '')}")
             return
 
         # Roll for success/failure/death
         roll = random.randint(1, 100)
         if roll <= path_info['success_rate']:
             outcome = path_info['success']
-            color = 0x57F287  # Green
+            color = 0x57F287
             succeeded = True
             died = False
+            logger.info(f"Success roll: {roll} <= {path_info['success_rate']}")
         else:
-            # On failure, check for death
             death_roll = random.randint(1, 100)
             if death_roll <= path_info['death_rate']:
                 outcome = path_info['death']
-                color = 0xFF0000  # Bright red for death
+                color = 0xFF0000
                 succeeded = False
                 died = True
+                logger.info(f"Death roll: {death_roll} <= {path_info['death_rate']}")
             else:
                 outcome = path_info['failure']
-                color = 0xED4245  # Normal red
+                color = 0xED4245
                 succeeded = False
                 died = False
+                logger.info(f"Failure roll: {roll} > {path_info['success_rate']}, survived death roll")
         
+        # Show outcome with next scene notification
         embed = discord.Embed(
-            description=f"```\n{outcome}\n```",
+            description=f"```\n{outcome}\n```\n🔄 Generating your next scene...",
             color=color
         )
         
-        # Show progress only if alive
-        if not died:
-            progress = "○ - " * 4 + "○"
-            embed.add_field(name="", value=progress, inline=False)
+        if self.player.consecutive_failures > 0:
+            embed.set_footer(text=f"⚠️ Death chance increased by {death_rate_modifier}% due to {self.player.consecutive_failures} consecutive failures!")
         
+        logger.info(f"Showing outcome after {time.time() - start_time:.2f}s")
         await interaction.response.edit_message(
             embed=embed,
-            view=self
+            view=self,
+            attachments=[]
         )
         
         if died:
-            # End the game
             game.end_game(self.player.user_id)
-            
-            # Add death message after delay
+            logger.info(f"Player died after {time.time() - start_time:.2f}s")
             await asyncio.sleep(2)
             death_embed = discord.Embed(
                 title="GAME OVER",
@@ -464,35 +500,86 @@ class AdventureView(discord.ui.View):
             )
             await interaction.edit_original_response(
                 embed=death_embed,
-                view=None  # Remove buttons
+                view=None,
+                attachments=[]
             )
             return
         
-        # Continue game if alive
         await asyncio.sleep(2)
         
+        # Generate next scene
         context = {
             "current_location": location["name"],
             "chosen_path": path_info["name"],
             "succeeded": succeeded,
-            "outcome": outcome
+            "outcome": outcome,
+            "consecutive_failures": self.player.consecutive_failures
         }
         
+        logger.info("Generating next location")
         next_location = await self.game.generate_location(context, self.player)
         if next_location:
             self.player.location = next_location["id"]
+            self.player.scenes_completed += 1
             
+            # Create new embed with new image
             new_embed = discord.Embed(
                 title=next_location['name'],
                 description=f"```\n{next_location['description']}\n```",
                 color=0x2f3136
             )
             
-            self.update_buttons()
+            if self.player.consecutive_failures > 0:
+                new_embed.set_footer(text=f"⚠️ Current Death Chance Modifier: +{death_rate_modifier}%")
             
+            # Handle new image
+            image_start = time.time()
+            if "image" in next_location:
+                logger.info("Processing new image")
+                image_bytes = base64.b64decode(next_location["image"])
+                image = Image.open(io.BytesIO(image_bytes))
+                
+                aspect_ratio = image.width / image.height
+                new_height = 400
+                new_width = int(new_height * aspect_ratio)
+                image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                
+                buffer = io.BytesIO()
+                image.save(buffer, format='PNG')
+                buffer.seek(0)
+                
+                file = discord.File(buffer, filename="location.png")
+                new_embed.set_image(url="attachment://location.png")
+                logger.info(f"Image processed in {time.time() - image_start:.2f}s")
+                
+                self.update_buttons()
+                logger.info(f"Updating message with new image after {time.time() - start_time:.2f}s")
+                
+                await interaction.edit_original_response(
+                    content=f"🎮 Hey {interaction.user.mention}, your next scene is ready!",
+                    embed=new_embed,
+                    view=self,
+                    attachments=[file]
+                )
+            else:
+                logger.warning("No image in next location")
+                self.update_buttons()
+                await interaction.edit_original_response(
+                    content=f"🎮 Hey {interaction.user.mention}, your next scene is ready!",
+                    embed=new_embed,
+                    view=self,
+                    attachments=[]
+                )
+        else:
+            error_embed = discord.Embed(
+                description="❌ Something went wrong generating the next scene. Please try again.",
+                color=0xFF0000
+            )
             await interaction.edit_original_response(
-                embed=new_embed,
-                view=self
+                content=f"⚠️ {interaction.user.mention}, there was an error!",
+                embed=error_embed,
+                view=None,
+                attachments=[]
             )
 
 def create_error_embed(message: str) -> discord.Embed:
@@ -594,6 +681,10 @@ async def start_adventure(interaction: discord.Interaction):
         view=view,
         attachments=files
     )
+
+@client.tree.command(name="start", description="Begin your adventure!")
+async def start_game(interaction: discord.Interaction):
+    await game.start_game(interaction)
 
 # Run the client
 client.run(os.getenv('DISCORD_TOKEN'))
