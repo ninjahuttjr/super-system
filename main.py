@@ -274,21 +274,36 @@ class AdventureGame:
                 "paths": [
                     {
                         "name": "First Choice (keep it short)",
-                        "description": "What happens (be funny)",
-                        "target_id": "next_location_id"
+                        "description": "Current situation",
+                        "success": "Funny success outcome + what you gained",
+                        "failure": "Humorous failure outcome + what you lost",
+                        "death": "How you died (make it funny but fatal)",
+                        "target_id": "next_location_id",
+                        "success_rate": 70,  # Higher number = easier
+                        "death_rate": 10     # Chance of death on failure
                     },
                     {
                         "name": "Second Choice (keep it short)",
-                        "description": "What happens (be funny)",
-                        "target_id": "next_location_id"
+                        "description": "Current situation",
+                        "success": "Funny success outcome + what you gained",
+                        "failure": "Humorous failure outcome + what you lost",
+                        "death": "How you died (make it funny but fatal)",
+                        "target_id": "next_location_id",
+                        "success_rate": 40,  # Lower number = harder
+                        "death_rate": 25     # Higher death chance for risky choice
                     }
                 ]
             }
 
             REQUIREMENTS:
-            - EXACTLY 2 choices only
-            - Keep descriptions short and funny
-            - Make choices memorable"""
+            - EXACTLY 2 choices
+            - First choice: Safer but smaller reward
+            - Second choice: Riskier but bigger reward
+            - Include funny death scenarios
+            - Keep descriptions witty and fun
+            - Success outcomes give items/rewards
+            - Failure outcomes have consequences
+            - Death outcomes end the game"""
             
             if not context.get('theme'):
                 themes = [
@@ -387,13 +402,11 @@ class AdventureView(discord.ui.View):
             self.add_item(button)
 
     async def button_callback(self, interaction: discord.Interaction):
-        # Get the custom_id from the button that was clicked
         clicked_button = interaction.data['custom_id']
         
-        # Turn the clicked button green
         for item in self.children:
             if item.custom_id == clicked_button:
-                item.style = discord.ButtonStyle.success  # Green when clicked
+                item.style = discord.ButtonStyle.success
                 
         path_id = clicked_button.replace('path_', '')
         location = self.game.locations.get(self.player.location)
@@ -402,18 +415,85 @@ class AdventureView(discord.ui.View):
         if not path_info:
             return
 
+        # Roll for success/failure/death
+        roll = random.randint(1, 100)
+        if roll <= path_info['success_rate']:
+            outcome = path_info['success']
+            color = 0x57F287  # Green
+            succeeded = True
+            died = False
+        else:
+            # On failure, check for death
+            death_roll = random.randint(1, 100)
+            if death_roll <= path_info['death_rate']:
+                outcome = path_info['death']
+                color = 0xFF0000  # Bright red for death
+                succeeded = False
+                died = True
+            else:
+                outcome = path_info['failure']
+                color = 0xED4245  # Normal red
+                succeeded = False
+                died = False
+        
         embed = discord.Embed(
-            description=path_info['description'],
-            color=0x2f3136
+            description=f"```\n{outcome}\n```",
+            color=color
         )
         
-        progress = "○ - " * 4 + "○"
-        embed.add_field(name="", value=progress, inline=False)
+        # Show progress only if alive
+        if not died:
+            progress = "○ - " * 4 + "○"
+            embed.add_field(name="", value=progress, inline=False)
         
         await interaction.response.edit_message(
             embed=embed,
             view=self
         )
+        
+        if died:
+            # End the game
+            game.end_game(self.player.user_id)
+            
+            # Add death message after delay
+            await asyncio.sleep(2)
+            death_embed = discord.Embed(
+                title="GAME OVER",
+                description="```\nYou died! Use /start to try again.\n```",
+                color=0xFF0000
+            )
+            await interaction.edit_original_response(
+                embed=death_embed,
+                view=None  # Remove buttons
+            )
+            return
+        
+        # Continue game if alive
+        await asyncio.sleep(2)
+        
+        context = {
+            "current_location": location["name"],
+            "chosen_path": path_info["name"],
+            "succeeded": succeeded,
+            "outcome": outcome
+        }
+        
+        next_location = await self.game.generate_location(context, self.player)
+        if next_location:
+            self.player.location = next_location["id"]
+            
+            new_embed = discord.Embed(
+                title=next_location['name'],
+                description=f"```\n{next_location['description']}\n```",
+                color=0x2f3136
+            )
+            
+            self.update_buttons()
+            
+            await interaction.edit_original_response(
+                embed=new_embed,
+                view=self
+            )
 
 def create_error_embed(message: str) -> discord.Embed:
     return discord.Embed(
