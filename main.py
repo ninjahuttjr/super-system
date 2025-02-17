@@ -53,6 +53,8 @@ class Player:
         self.user_id = user_id
         self.location = None
         self.inventory = []
+        self.active_message_id = None  # Store the active message ID
+        self.channel_id = None  # Store the channel where the game is active
         self.health = 100
         self.gold = 0
         self.history = []
@@ -61,6 +63,7 @@ class AdventureGame:
     def __init__(self):
         self.players = {}  # Will store Player objects
         self.locations = {}
+        self.active_messages = {}  # Store message IDs for active game sessions
         self.comfy_ws_url = "ws://127.0.0.1:8188/ws"
         
     def get_player(self, user_id: int) -> Player:
@@ -106,7 +109,7 @@ class AdventureGame:
                 },
                 "9": {
                     "inputs": {
-                        "filename_prefix": "ComfyUI",
+                        "filename_prefix": "AdventureBot_",
                         "images": ["8", 0]
                     },
                     "class_type": "SaveImage"
@@ -215,7 +218,6 @@ class AdventureGame:
             }
             
             async with aiohttp.ClientSession() as session:
-                # Queue the prompt
                 logger.info("Queueing prompt with ComfyUI")
                 async with session.post('http://127.0.0.1:8188/prompt', json={"prompt": workflow}) as response:
                     if response.status != 200:
@@ -224,99 +226,89 @@ class AdventureGame:
                         raise Exception(f"Failed to queue prompt: {error_text}")
                         
                     prompt_data = await response.json()
-                    prompt_id = prompt_data['prompt_id']
-                    logger.info(f"Prompt queued successfully with ID: {prompt_id}")
-                
-                # Connect to websocket
-                logger.info(f"Connecting to WebSocket at {self.comfy_ws_url}")
-                async with session.ws_connect(self.comfy_ws_url) as websocket:
-                    while True:
-                        try:
-                            msg = await websocket.receive()
-                            
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                data = json.loads(msg.data)
-                                
-                                if data["type"] == "progress":
-                                    value = data.get("data", {}).get("value", 0)
-                                    max_value = data.get("data", {}).get("max", 100)
-                                    print(f"Progress: {value}/{max_value}")
-                                    logger.info(f"Generation progress: {value}/{max_value}")
-                                    
-                                    # When we hit step 20, that's our signal!
-                                    if value == 20:
-                                        logger.info("Generation complete! Getting image...")
-                                        await asyncio.sleep(2.0)  # Wait for file to be written
-                                        
-                                        output_dir = r"C:\Users\HawkAdmin\Desktop\Comfy\ComfyUI_windows_portable\ComfyUI\output"
-                                        logger.info(f"Checking directory: {output_dir}")
-                                        
-                                        try:
-                                            files = [f for f in os.listdir(output_dir) if f.startswith('ComfyUI_') and f.endswith('.png')]
-                                            logger.info(f"Found files: {files}")
-                                            
-                                            if files:
-                                                latest_file = max([os.path.join(output_dir, f) for f in files], key=os.path.getmtime)
-                                                logger.info(f"Using latest file: {latest_file}")
-                                                with open(latest_file, 'rb') as f:
-                                                    image_bytes = f.read()
-                                                    logger.info(f"Successfully read image file: {latest_file} ({len(image_bytes)} bytes)")
-                                                    return image_bytes
-                                            else:
-                                                logger.error("No ComfyUI_ files found in output directory")
-                                        except Exception as e:
-                                            logger.error(f"Error accessing output directory: {str(e)}")
-                                        break
-                            
-                        except Exception as e:
-                            logger.error(f"Error processing message: {str(e)}")
-                            break
+                    our_prompt_id = prompt_data['prompt_id']
+                    logger.info(f"Prompt queued successfully with ID: {our_prompt_id}")
 
-            return None
-            
+                # Poll the history endpoint until our prompt is complete
+                while True:
+                    async with session.get('http://127.0.0.1:8188/history') as response:
+                        if response.status == 200:
+                            history = await response.json()
+                            if our_prompt_id in history:
+                                prompt_info = history[our_prompt_id]
+                                logger.debug(f"Prompt status: {prompt_info}")
+                                
+                                if 'outputs' in prompt_info and '9' in prompt_info['outputs']:  # Node 9 is our SaveImage node
+                                    logger.info("Generation complete! Getting image...")
+                                    await asyncio.sleep(2.0)  # Wait for file to be written
+                                    
+                                    output_dir = r"C:\Users\HawkAdmin\Desktop\Comfy\ComfyUI_windows_portable\ComfyUI\output"
+                                    logger.info(f"Checking directory: {output_dir}")
+                                    
+                                    try:
+                                        files = [f for f in os.listdir(output_dir) if f.startswith('AdventureBot_') and f.endswith('.png')]
+                                        logger.info(f"Found files: {files}")
+                                        
+                                        if files:
+                                            latest_file = max([os.path.join(output_dir, f) for f in files], key=os.path.getmtime)
+                                            logger.info(f"Using latest file: {latest_file}")
+                                            with open(latest_file, 'rb') as f:
+                                                image_bytes = f.read()
+                                                logger.info(f"Successfully read image file: {latest_file} ({len(image_bytes)} bytes)")
+                                                return image_bytes
+                                        else:
+                                            logger.error("No AdventureBot_ files found in output directory")
+                                    except Exception as e:
+                                        logger.error(f"Error accessing output directory: {str(e)}")
+                                    break
+                
+                    await asyncio.sleep(1.0)  # Wait a second before polling again
+                            
         except Exception as e:
             logger.error(f"Error in generate_location_image: {str(e)}")
-            return None
+            raise
 
     async def generate_location(self, context: str, player: Player) -> Dict:
-        """Generate a new location using GPT-4"""
         try:
             client = OpenAI()
             
-            # Include player history in the context
-            history_context = "\n".join(player.history[-3:]) if player.history else ""
-            prompt = f"""Generate a fantasy location with context: {context}
-                        Player's recent history: {history_context}"""
+            system_prompt = """You are generating locations for a dark fantasy RPG aimed at adult players. 
+            Create gritty, mature locations with:
+            - Realistic, harsh environments
+            - Dark fantasy elements (think Dark Souls, The Witcher)
+            - Context-specific paths and actions (not just cardinal directions)
+            - Brief, impactful descriptions (2-3 sentences max)
+            - Practical items and interactive elements
+            
+            Output must be valid JSON with fields: 
+            id (string), 
+            name (string), 
+            description (string), 
+            paths (array of objects with: {
+                "name": "descriptive name of path/action",
+                "description": "brief description of what this path/action means",
+                "target_id": "location_id of destination"
+            }),
+            items (array of strings)"""
             
             completion = client.chat.completions.create(
                 model="gpt-4",
                 messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a creative fantasy game location generator. Output must be valid JSON with fields: id (string), name (string), description (string), exits (object with direction strings as keys and location IDs as values), and items (array of strings)."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"Generate a location connected to: {context}"}
                 ],
                 temperature=0.7
             )
             
             location_data = json.loads(completion.choices[0].message.content)
             
-            # Generate image
-            image_prompt = f"fantasy location, {location_data['description']}, detailed, magical, 4k, high quality"
+            # Generate image with darker theme
+            image_prompt = f"dark fantasy location, {location_data['description']}, gritty, atmospheric, realistic lighting, detailed, 4k"
             image_data = await self.generate_location_image(image_prompt)
             if image_data:
                 location_data["image"] = base64.b64encode(image_data).decode('utf-8')
             
-            # Store location and update player history
             self.locations[location_data['id']] = location_data
-            player.history.append(f"Visited {location_data['name']}: {location_data['description'][:100]}...")
-            if len(player.history) > 5:
-                player.history.pop(0)
-                
             return location_data
             
         except Exception as e:
@@ -328,116 +320,114 @@ class AdventureView(discord.ui.View):
         super().__init__(timeout=180)
         self.game = game
         self.player = player
+        self.history = []  # Track movement history
         self.update_buttons()
-    
+        
     def update_buttons(self):
         self.clear_items()
         location = self.game.locations.get(self.player.location)
         if not location:
             return
             
-        # Direction buttons with emojis
-        for direction, loc_id in location["exits"].items():
-            emoji = {
-                "north": "⬆️",
-                "south": "⬇️",
-                "east": "➡️",
-                "west": "⬅️"
-            }.get(direction.lower(), "🚶")
-            
+        # Movement buttons
+        for path in location["paths"]:
             button = discord.ui.Button(
-                label=direction.title(),
-                custom_id=f"move_{direction}",
+                label=path["name"],
                 style=discord.ButtonStyle.primary,
-                emoji=emoji
+                emoji="🚶",
+                custom_id=f"move_{path['target_id']}"
             )
-            button.callback = self.move_callback
+            
+            async def button_callback(interaction: discord.Interaction, path_info=path):
+                # Disable all buttons immediately
+                for item in self.children:
+                    item.disabled = True
+                await interaction.response.edit_message(view=self)
+                
+                # Create transition embed
+                loading_embed = discord.Embed(
+                    title=f"🌟 {location['name']} → {path_info['name']}",
+                    description=f"*{path_info['description']}*",
+                    color=discord.Color.gold()
+                )
+                loading_embed.add_field(
+                    name="Status",
+                    value="```\n🚶 Moving...\n🎨 Discovering new area...\n```",
+                    inline=False
+                )
+                
+                if "image" in location:
+                    image_bytes = base64.b64decode(location["image"])
+                    file = discord.File(io.BytesIO(image_bytes), filename="location.png")
+                    loading_embed.set_image(url="attachment://location.png")
+                    await interaction.edit_original_response(embed=loading_embed, attachments=[file])
+                else:
+                    await interaction.edit_original_response(embed=loading_embed)
+                
+                # Generate new location with context from history
+                if path_info["target_id"] not in self.game.locations:
+                    context = self.build_location_context(path_info)
+                    new_location = await self.game.generate_location(context, self.player)
+                    if not new_location:
+                        error_embed = discord.Embed(
+                            title="❌ Error",
+                            description="Failed to generate new location!",
+                            color=discord.Color.red()
+                        )
+                        await interaction.edit_original_response(embed=error_embed)
+                        return
+                    
+                    self.game.locations[path_info["target_id"]] = new_location
+                
+                # Update history and location
+                self.history.append({
+                    "from": self.player.location,
+                    "to": path_info["target_id"],
+                    "path": path_info["name"]
+                })
+                self.player.location = path_info["target_id"]
+                await self.update_location_display(interaction)
+            
+            button.callback = button_callback
             self.add_item(button)
         
         # Action buttons
-        if location["items"]:
-            interact_button = discord.ui.Button(
-                label="Search Area",
-                custom_id="interact",
-                style=discord.ButtonStyle.success,
-                emoji="🔍"
+        if location.get("items"):
+            examine_button = discord.ui.Button(
+                label="Examine Area",
+                style=discord.ButtonStyle.secondary,
+                emoji="🔍",
+                row=1
             )
-            interact_button.callback = self.interact_callback
-            self.add_item(interact_button)
-        
-        # Character button
-        char_button = discord.ui.Button(
-            label="Character",
-            custom_id="character",
+            self.add_item(examine_button)
+            
+        inventory_button = discord.ui.Button(
+            label="Inventory",
             style=discord.ButtonStyle.secondary,
-            emoji="👤"
+            emoji="🎒",
+            row=1
         )
-        char_button.callback = self.character_callback
-        self.add_item(char_button)
-
-    async def move_callback(self, interaction: discord.Interaction):
-        direction = interaction.custom_id.split("_")[1]
-        location = self.game.locations[self.player.location]
+        self.add_item(inventory_button)
         
-        await interaction.response.defer(thinking=True)
+    def build_location_context(self, path_info):
+        """Build context string based on movement history"""
+        current_location = self.game.locations[self.player.location]
+        context_parts = []
         
-        if direction in location["exits"]:
-            new_loc_id = location["exits"][direction]
-            
-            # Generate new location if needed
-            if new_loc_id not in self.game.locations:
-                context = f"Connected to {location['name']} from the {direction}"
-                new_location = await self.game.generate_location(context, self.player)
-                if not new_location:
-                    await interaction.followup.send("Failed to generate new location!", ephemeral=True)
-                    return
-            
-            self.player.location = new_loc_id
-            await self.update_location_display(interaction)
-
-    async def character_callback(self, interaction: discord.Interaction):
-        embed = discord.Embed(
-            title=f"👤 {interaction.user.name}'s Character",
-            color=discord.Color.gold()
-        )
+        # Add current location context
+        context_parts.append(f"You are leaving {current_location['name']}")
         
-        # Add character stats
-        embed.add_field(name="📍 Current Location", value=self.game.locations[self.player.location]["name"], inline=False)
-        embed.add_field(name="🎒 Inventory", value="\n".join(self.player.inventory) if self.player.inventory else "Empty", inline=False)
-        embed.add_field(name="📜 Recent History", value="\n".join(self.player.history[-3:]) if self.player.history else "No adventures yet", inline=False)
+        # Add path context
+        context_parts.append(f"through {path_info['name']}")
         
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    async def interact_callback(self, interaction: discord.Interaction):
-        location = self.game.locations[self.player.location]
-        
-        if not location["items"]:
-            await interaction.response.send_message("There's nothing interesting to interact with here.", ephemeral=True)
-            return
-            
-        # Create select menu for items
-        select = discord.ui.Select(
-            placeholder="Choose an item to interact with...",
-            options=[
-                discord.SelectOption(
-                    label=item,
-                    description=f"Interact with {item}",
-                    value=item
-                ) for item in location["items"]
-            ]
-        )
-        
-        async def select_callback(interaction: discord.Interaction):
-            item = select.values[0]
-            location["items"].remove(item)
-            self.player.inventory.append(item)
-            await interaction.response.send_message(f"You picked up the {item}!", ephemeral=True)
-            self.update_buttons()
-            
-        select.callback = select_callback
-        view = discord.ui.View()
-        view.add_item(select)
-        await interaction.response.send_message("What would you like to interact with?", view=view, ephemeral=True)
+        # Add recent history context (last 2 moves)
+        if self.history:
+            recent = self.history[-2:]
+            for move in recent:
+                from_loc = self.game.locations[move['from']]
+                context_parts.append(f"Previously moved from {from_loc['name']} via {move['path']}")
+                
+        return " | ".join(context_parts)
 
     async def update_location_display(self, interaction: discord.Interaction):
         location = self.game.locations[self.player.location]
@@ -457,7 +447,7 @@ class AdventureView(discord.ui.View):
             
         embed.add_field(
             name="📍 Available Paths",
-            value=" | ".join([f"→ {direction.title()}" for direction in location["exits"].keys()]),
+            value="\n".join([f"→ {path['name']}" for path in location["paths"]]),
             inline=False
         )
         
@@ -467,8 +457,9 @@ class AdventureView(discord.ui.View):
                 value="\n".join([f"• {item}" for item in location["items"]]),
                 inline=False
             )
-            
-        await interaction.followup.send(embed=embed, view=self, files=files)
+        
+        self.update_buttons()  # Re-enable buttons with new options
+        await interaction.edit_original_response(embed=embed, view=self, attachments=files)
 
 client = MyClient()
 
@@ -577,12 +568,12 @@ async def userinfo(interaction: discord.Interaction, user: discord.Member = None
     await interaction.response.send_message(embed=embed)
 
 # Add these new commands after your existing commands
-@client.tree.command(name="start_adventure", description="Start or continue your adventure")
+@client.tree.command(name="start_adventure", description="Start a new adventure")
 async def start_adventure(interaction: discord.Interaction):
-    # Create loading embed
+    # Create initial loading embed
     loading_embed = discord.Embed(
         title="🌟 Embarking on an Adventure",
-        description="Preparing your journey into a magical realm...",
+        description="Preparing your journey into a dark realm...",
         color=discord.Color.blue()
     )
     loading_embed.add_field(
@@ -593,22 +584,27 @@ async def start_adventure(interaction: discord.Interaction):
     loading_embed.set_footer(text="This may take a minute as we craft your unique experience...")
     
     await interaction.response.send_message(embed=loading_embed)
+    initial_message = await interaction.original_response()
     
-    player = game.get_player(interaction.user.id)
+    # Initialize player and game
+    player = Player(interaction.user.id)
+    player.active_message_id = initial_message.id
+    player.channel_id = interaction.channel_id
+    game = AdventureGame()
+    game.active_messages[initial_message.id] = player
     
-    if not player.location:
-        location = await game.generate_location("Generate a starting hub location", player)
-        if not location:
-            error_embed = discord.Embed(
-                title="❌ Adventure Creation Failed",
-                description="Something went wrong while creating your adventure. Please try again.",
-                color=discord.Color.red()
-            )
-            await interaction.edit_original_response(embed=error_embed)
-            return
-        player.location = location["id"]
-    
-    location = game.locations[player.location]
+    # Generate starting location
+    location = await game.generate_location("starting area", player)
+    if not location:
+        error_embed = discord.Embed(
+            title="❌ Adventure Creation Failed",
+            description="Something went wrong while creating your adventure. Please try again.",
+            color=discord.Color.red()
+        )
+        await interaction.edit_original_response(embed=error_embed)
+        return
+        
+    player.location = location["id"]
     
     # Create the main adventure embed
     embed = discord.Embed(
@@ -617,18 +613,16 @@ async def start_adventure(interaction: discord.Interaction):
         color=discord.Color.blue()
     )
     
-    # Prepare the image if we have one
     files = []
     if "image" in location:
         image_bytes = base64.b64decode(location["image"])
         file = discord.File(io.BytesIO(image_bytes), filename="location.png")
         embed.set_image(url="attachment://location.png")
         files.append(file)
-    
-    # Add location details
+        
     embed.add_field(
         name="📍 Available Paths",
-        value=" | ".join([f"→ {direction.title()}" for direction in location["exits"].keys()]),
+        value="\n".join([f"→ {path['name']}" for path in location["paths"]]),
         inline=False
     )
     
@@ -639,7 +633,7 @@ async def start_adventure(interaction: discord.Interaction):
             inline=False
         )
     
-    embed.set_footer(text="Use the buttons below to interact with your surroundings")
+    embed.set_footer(text=f"Game ID: {initial_message.id} • Use /continue {initial_message.id} to resume this game")
     
     view = AdventureView(game, player)
     await interaction.edit_original_response(
@@ -648,6 +642,28 @@ async def start_adventure(interaction: discord.Interaction):
         view=view,
         attachments=files
     )
+
+@client.tree.command(name="continue", description="Continue an existing adventure")
+@app_commands.describe(game_id="The Game ID from the adventure you want to continue")
+async def continue_adventure(interaction: discord.Interaction, game_id: str):
+    game = AdventureGame()
+    if game_id not in game.active_messages:
+        await interaction.response.send_message("Could not find an active game with that ID!", ephemeral=True)
+        return
+        
+    player = game.active_messages[game_id]
+    location = game.locations[player.location]
+    
+    # Create new game message in current channel
+    embed = create_location_embed(location, game_id)
+    view = AdventureView(game, player)
+    
+    await interaction.response.send_message(embed=embed, view=view)
+    new_message = await interaction.original_response()
+    
+    # Update active message tracking
+    player.active_message_id = new_message.id
+    game.active_messages[new_message.id] = player
 
 @client.tree.command(name="go", description="Move in a direction")
 @app_commands.describe(direction="The direction to move (north, south, east, west)")
