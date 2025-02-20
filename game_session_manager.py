@@ -3,6 +3,8 @@ from typing import Dict, Optional
 import discord
 from datetime import datetime, timedelta
 import logging
+import asyncio
+import random
 
 logger = logging.getLogger('GameSessionManager')
 
@@ -166,4 +168,139 @@ class GameSessionManager:
             return False, "This game session has expired due to inactivity. Please start a new game."
             
         session.update_interaction()
-        return True, "" 
+        return True, ""
+
+class ChoiceButton(discord.ui.Button):
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            # Validate the interaction through session manager
+            should_process, message = await session_manager.handle_interaction(interaction)
+            if not should_process:
+                await interaction.response.send_message(message, ephemeral=True)
+                return
+
+            view: AdventureView = self.view
+            if interaction.user.id != view.player.user_id:
+                await interaction.response.send_message("This isn't your adventure!", ephemeral=True)
+                return
+
+            # Disable all buttons immediately
+            for item in view.children:
+                item.disabled = True
+                if item == self:
+                    item.style = discord.ButtonStyle.success
+                else:
+                    item.style = discord.ButtonStyle.secondary
+            
+            await interaction.response.edit_message(view=view)
+            
+            # Generate suspense message
+            processing_data = await view.game.generate_processing_message(
+                view.player.theme_style,
+                view.player.setting,
+                self.label
+            )
+            
+            # Show choice processing
+            suspense_embed = discord.Embed(
+                title="⏳ " + processing_data["processing_message"],
+                description=f"You chose: {self.label}",
+                color=0xffff00
+            )
+            await interaction.edit_original_response(embed=suspense_embed, view=view)
+            await asyncio.sleep(3)
+            
+            # Roll for success
+            roll = random.randint(1, 100)
+            success = roll <= self.success_rate
+            
+            # Show roll result
+            result_embed = discord.Embed(
+                title=processing_data["result_title"],
+                description=f"Required: {self.success_rate} or less\nActual: {roll}",
+                color=0xffff00
+            )
+            await interaction.edit_original_response(embed=result_embed, view=view)
+            await asyncio.sleep(2)
+
+            # Record the choice
+            view.player.choice_history.append({
+                'scene': view.player.current_scene_number,
+                'choice': self.label,
+                'description': view.player.current_scene["description"]
+            })
+
+            if not success:
+                view.player.lives_remaining -= 1
+                failure_data = await view.game.generate_failure_message(
+                    view.player,
+                    self.label,
+                    roll,
+                    self.success_rate
+                )
+                
+                if view.player.lives_remaining <= 0:
+                    # Game Over - No lives left
+                    await view.game.handle_game_over(interaction, view.player, failure_data["message"])
+                    return
+
+                # Show failure but continue
+                failure_embed = discord.Embed(
+                    title="💔 Life Lost!",
+                    description=failure_data["message"],
+                    color=0xff7700
+                )
+                failure_embed.add_field(
+                    name="Consequence",
+                    value=f"Lives Remaining: {'❤️' * view.player.lives_remaining}\nDealing with the aftermath...",
+                    inline=False
+                )
+                await interaction.edit_original_response(embed=failure_embed, view=None)
+                await asyncio.sleep(3)
+
+            # Generate next scene
+            next_scene = await view.game.generate_next_scene(
+                view.player,
+                self.label,
+                success,
+                failure_data["message"] if not success else None
+            )
+            
+            # Increment scene number
+            view.player.current_scene_number += 1
+            
+            # Check for victory condition
+            if view.player.current_scene_number > view.game.MAX_SCENES:
+                victory_scene = await view.game.generate_victory_scene(
+                    view.player,
+                    self.label
+                )
+                view.player.current_scene = victory_scene
+                
+                victory_embed = await view.game.create_game_embed(view.player)
+                victory_embed.add_field(
+                    name="🎉 Mission Complete!",
+                    value=victory_scene["description"],
+                    inline=False
+                )
+                await interaction.edit_original_response(embed=victory_embed, view=None)
+                
+                # Clean up completed game
+                if interaction.user.id in view.game.active_games:
+                    del view.game.active_games[interaction.user.id]
+                return
+            
+            # Continue to next scene
+            view.player.current_scene = next_scene
+            new_embed = await view.game.create_game_embed(view.player)
+            await interaction.edit_original_response(
+                embed=new_embed,
+                view=AdventureView(view.game, view.player)
+            )
+
+        except Exception as e:
+            logger.error(f"Error in button callback: {str(e)}")
+            try:
+                await interaction.followup.send("An error occurred.", ephemeral=True)
+            except:
+                logger.error("Failed to send error message") 

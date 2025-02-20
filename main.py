@@ -17,6 +17,7 @@ import logging
 from openai import OpenAI
 import time
 from game_session_manager import GameSessionManager
+from datetime import datetime, timedelta
 
 # Load environment variables
 load_dotenv()
@@ -138,11 +139,10 @@ class Player:
         self.main_goal = None
         self.setting = None
         self.theme_style = None
-        self.total_scenes = None
+        self.total_scenes = 5  # Fixed at 5 scenes
         self.current_scene = None
-        self.scenes_completed = 0  # Start at 0
+        self.current_scene_number = 1  # Start at scene 1
         self.choice_history = []
-        self.is_final_scene = False
         self.lives_remaining = 3
         self.max_lives = 3
 
@@ -150,23 +150,21 @@ class Player:
 
 class AdventureGame:
     def __init__(self):
-        self.MAX_SCENES = 7  # Fixed number of scenes
+        self.MAX_SCENES = 5  # Fixed at 5 scenes
         self.active_games = {}
         self.generation_status = {}
         logger.info("AdventureGame initialized")
 
-    def get_scaled_success_rates(self, scene_number: int, total_scenes: int) -> tuple[int, int]:
+    def get_scaled_success_rates(self, scene_number: int) -> tuple[int, int]:
         """Returns progressively harder success rates as game progresses"""
         base_rates = {
-            1: (70, 40),  # First scene: 70/40
-            2: (65, 35),  # Second scene: 65/35
-            3: (60, 30),  # Third scene: 60/30
-            4: (55, 25),  # Fourth scene: 55/25
-            5: (50, 20),  # Final scene: 50/20
-            6: (45, 15),  # Sixth scene: 45/15
-            7: (40, 10)   # Seventh scene: 40/10
+            1: (70, 40),  # First scene: easier to encourage players
+            2: (65, 35),  # Second scene: slightly harder
+            3: (60, 30),  # Third scene: medium difficulty
+            4: (55, 25),  # Fourth scene: challenging
+            5: (50, 20)   # Final scene: most challenging
         }
-        return base_rates.get(scene_number, (50, 20))
+        return base_rates.get(scene_number, (50, 20))  # Default to hardest if scene number invalid
 
     async def start_game(self, interaction: discord.Interaction) -> Player:
         """Initialize a new game session"""
@@ -190,7 +188,7 @@ class AdventureGame:
             Think everyday situations with a twist, like:
             - Teaching a robot to be a food critic
             - Running tech support for time travelers
-            - Bartending a dive bar for aliens
+            - Tending a taco bar for aliens
             - Being an intern at a weather control station
             - Fixing bugs in a virtual reality gym
             - Running a tire shop at the border for Mexican Cartel
@@ -198,31 +196,32 @@ class AdventureGame:
             NO fantasy clichés (no dragons, knights, fairies, unicorns, etc.)
             NO medieval or ancient settings
             
+            CRITICAL: Story MUST be exactly 5 scenes long!
+            
             Return ONLY JSON:
             {
-                "total_scenes": "Number between 4 and 7",
+                "total_scenes": 5,  # MUST be exactly 5
                 "quest_name": "Short, fun title (3-4 words)",
                 "main_goal": "One simple goal",
                 "setting": "One modern location",
                 "theme_style": "Two words for the mood (example: 'quirky tech')"
-            }
-            """
+            }"""
             
             structure_response = client.chat.completions.create(
-                model="gpt-4o-2024-08-06",
+                model="gpt-4-0125-preview",
                 messages=[{"role": "developer", "content": structure_prompt}],
                 response_format={"type": "json_object"},
                 temperature=0.9
             )
             
             structure_data = json.loads(structure_response.choices[0].message.content)
-            # Ensure minimum of 4 scenes
-            structure_data["total_scenes"] = max(4, int(structure_data["total_scenes"]))
+            # Force 5 scenes regardless of what was generated
+            structure_data["total_scenes"] = self.MAX_SCENES
             
             logger.info(f"Generated story structure: {json.dumps(structure_data, indent=2)}")
             
             # Now generate the initial scene with knowledge of total scenes
-            safe_rate, risky_rate = self.get_scaled_success_rates(1, structure_data["total_scenes"])
+            safe_rate, risky_rate = self.get_scaled_success_rates(1)
             
             initial_scene_prompt = f"""Generate the initial scene for this QUIRKY adventure:
             Quest Name: {structure_data['quest_name']}
@@ -300,8 +299,9 @@ class AdventureGame:
         )
         
         # Progress bar using custom emojis or unicode
-        progress = "○" * self.MAX_SCENES
-        progress = progress[:player.scenes_completed] + "●" + progress[player.scenes_completed + 1:]
+        progress = "○" * player.total_scenes
+        current_progress = min(player.current_scene_number - 1, player.total_scenes)  # Use current_scene_number
+        progress = progress[:current_progress] + "●" + progress[current_progress + 1:]
         
         # Add lives display with heart emojis
         lives = "❤️" * player.lives_remaining + "🖤" * (player.max_lives - player.lives_remaining)
@@ -312,16 +312,13 @@ class AdventureGame:
             inline=False
         )
         
-        embed.set_footer(text=f"{progress} | Scene {player.scenes_completed + 1}/{self.MAX_SCENES} | Lives: {lives}")
+        embed.set_footer(text=f"{progress} | Scene {player.current_scene_number}/{player.total_scenes} | Lives: {lives}")
         return embed
 
     async def generate_next_scene(self, player: Player, previous_choice: str, success: bool, failure_message: str = None) -> Dict:
         """Generate next scene that follows from previous events"""
-        # Only generate victory scene after completing all scenes including the final one
-        if player.scenes_completed >= self.MAX_SCENES:
-            return await self.generate_victory_scene(player, previous_choice)
-        
-        safe_rate, risky_rate = self.get_scaled_success_rates(player.scenes_completed + 1, self.MAX_SCENES)
+        # Get appropriate success rates for the next scene
+        safe_rate, risky_rate = self.get_scaled_success_rates(player.current_scene_number + 1)
         
         # Build story context from recent history
         story_context = "Recent events:\n"
@@ -333,79 +330,38 @@ class AdventureGame:
         if not success and failure_message:
             story_context += f"Result: {failure_message}\n"
         
-        # Add extra tension for final scene
-        if player.scenes_completed == self.MAX_SCENES - 1:
-            scene_prompt = f"""Create an EPIC FINAL SCENE that follows from:
-            Quest: {player.quest_name}
-            Goal: {player.main_goal}
-            Setting: {player.setting}
-            Style: {player.theme_style}
-            
-            {story_context}
-            Last Choice: {previous_choice}
-            Was Successful: {success}
-            
-            Rules:
-            1. This is the FINAL challenge - make it epic!
-            2. Choices should be dramatic and conclusive
-            3. Stakes should be at their highest
-            4. Keep choice text under 80 characters!
-            5. One safe but boring choice, one wild but risky choice
-            
-            Return ONLY JSON:
-            {{
-                "description": "The final challenge! (2 sentences max)",
-                "quest_status": "Everything hangs in the balance!",
-                "choices": [
-                    {{"text": "Safe but boring choice", "success_rate": {safe_rate}}},
-                    {{"text": "Wild, epic choice", "success_rate": {risky_rate}}}
-                ]
-            }}"""
-        else:
-            # Regular scene prompt
-            scene_prompt = f"""Create the next scene that follows from:
-            Quest: {player.quest_name}
-            Goal: {player.main_goal}
-            Setting: {player.setting}
-            Style: {player.theme_style}
-            
-            {story_context}
-            Last Choice: {previous_choice}
-            Was Successful: {success}
-            
-            Rules:
-            1. Keep it modern and relatable
-            2. No fantasy clichés
-            3. MUST directly reference or continue from the last choice AND failure message if it exists
-            4. Use simple, clear language
-            5. One choice should be normal, one should be wild
-            6. CRITICAL: Choice text must be 80 characters or less!
-            
-            Examples of GOOD choices:
-            - "Use the gravity net" (safe)
-            - "Start a space dance party" (wild)
-            
-            Examples of BAD choices (too long):
-            - "Attempt to recall the toppings using the gravitational cheese net"
-            - "Convince the toppings to join you in a musical number to distract them"
-            
-            Return ONLY JSON:
-            {{
-                "description": "What happens BECAUSE OF their last choice? (2 sentences max)",
-                "quest_status": "Simple progress update",
-                "choices": [
-                    {{"text": "Short, clear choice (max 80 chars)", "success_rate": {safe_rate}}},
-                    {{"text": "Wild alternative (max 80 chars)", "success_rate": {risky_rate}}}
-                ]
-            }}"""
+        scene_prompt = f"""Create the next scene that follows from:
+        Quest: {player.quest_name}
+        Goal: {player.main_goal}
+        Setting: {player.setting}
+        Style: {player.theme_style}
+        
+        {story_context}
+        Last Choice: {previous_choice}
+        Was Successful: {success}
+        
+        Rules:
+        1. Keep it modern and relatable
+        2. No fantasy clichés
+        3. MUST directly reference or continue from the last choice AND failure message if it exists
+        4. Use simple, clear language
+        5. One choice should be normal, one should be wild
+        6. CRITICAL: Choice text must be 80 characters or less!
+        
+        Return ONLY JSON:
+        {{
+            "description": "What happens BECAUSE OF their last choice? (2 sentences max)",
+            "quest_status": "Simple progress update",
+            "choices": [
+                {{"text": "Short, clear choice (max 80 chars)", "success_rate": {safe_rate}}},
+                {{"text": "Wild alternative (max 80 chars)", "success_rate": {risky_rate}}}
+            ]
+        }}"""
 
         client = OpenAI()
         response = client.chat.completions.create(
-            model="gpt-4o-2024-08-06",
-            messages=[{
-                "role": "developer",
-                "content": scene_prompt
-            }],
+            model="gpt-4-0125-preview",
+            messages=[{"role": "developer", "content": scene_prompt}],
             response_format={"type": "json_object"},
             temperature=0.7
         )
@@ -514,54 +470,45 @@ class AdventureGame:
         logger.info(f"Generated processing message:\n{json.dumps(processing_data, indent=2)}")
         return processing_data
 
-    async def handle_game_over(self, interaction: discord.Interaction, player: Player):
+    async def handle_game_over(self, interaction: discord.Interaction, player: Player, failure_message: str):
         """Handle game over state"""
         try:
-            # Generate game over embed
-            embed = discord.Embed(
+            game_over_embed = discord.Embed(
                 title="💀 Game Over",
-                color=0xFF0000  # Red
+                description=failure_message,
+                color=0xff0000
             )
             
-            if hasattr(player, 'current_failure_message'):
-                embed.add_field(
-                    name="What Happened",
-                    value=player.current_failure_message,
-                    inline=False
-                )
-            
-            embed.add_field(
-                name="📊 Final Report",
-                value=f"Scenes Completed: {player.scenes_completed}/{player.total_scenes}\n"
-                      f"Lives Used: {player.max_lives - player.lives_remaining}\n"
-                      f"Final Action: {player.choice_history[-1]['choice'] if player.choice_history else 'None'}",
-                inline=False
-            )
-            
-            embed.add_field(
-                name="Adventure Status",
-                value="Game Over",
+            game_over_embed.add_field(
+                name="Final Report",
+                value=f"Scenes Completed: {player.current_scene_number}/5\n"  # Fixed at 5
+                      f"Lives Used: {player.max_lives - player.lives_remaining}/{player.max_lives}\n"
+                      f"Final Scene: {player.current_scene['description']}",
                 inline=False
             )
             
             await interaction.edit_original_response(
-                embed=embed,
+                embed=game_over_embed,
                 view=None
             )
             
-            # CRITICAL: Clear the game state
+            # Clean up game state
             if interaction.user.id in self.active_games:
                 del self.active_games[interaction.user.id]
             if interaction.user.id in self.generation_status:
                 del self.generation_status[interaction.user.id]
             
+            # End the session
+            session_manager.end_session(interaction.user.id)
+            
         except Exception as e:
             logger.error(f"Error in handle_game_over: {e}")
-            # Still try to clear game state on error
+            # Ensure cleanup even on error
             if interaction.user.id in self.active_games:
                 del self.active_games[interaction.user.id]
             if interaction.user.id in self.generation_status:
                 del self.generation_status[interaction.user.id]
+            session_manager.end_session(interaction.user.id)
 
     async def process_choice(self, interaction: discord.Interaction, choice_text: str, success_rate: int):
         """Process player choice and determine outcome"""
@@ -571,34 +518,115 @@ class AdventureGame:
         roll = random.randint(1, 100)
         success = roll <= success_rate
         
-        # Record current scene number BEFORE any changes
-        current_scene = player.scenes_completed
-        
-        # Add choice to history with correct scene number
+        # Record choice at CURRENT scene number
         player.choice_history.append({
-            'scene': current_scene,
+            'scene': player.current_scene_number,
             'choice': choice_text,
             'description': player.current_scene["description"]
         })
         
-        # Increment scene counter
-        player.scenes_completed += 1
-        
+        # Handle failure
         if not success:
             player.lives_remaining -= 1
             if player.lives_remaining <= 0:
                 await self.handle_game_over(interaction, player)
                 return
+            
+            failure_data = await self.generate_failure_message(player, choice_text, roll, success_rate)
+            
+            # Show failure message
+            failure_embed = discord.Embed(
+                title="💔 Life Lost!",
+                description=failure_data["message"],
+                color=0xff7700
+            )
+            failure_embed.add_field(
+                name="Consequence",
+                value=f"Lives Remaining: {'❤️' * player.lives_remaining}\nDealing with the aftermath...",
+                inline=False
+            )
+            await interaction.edit_original_response(embed=failure_embed, view=None)
+            await asyncio.sleep(4)
         
-        # Check if this was the final scene
-        if player.scenes_completed >= player.total_scenes:
-            if success:
-                await self.handle_victory(interaction, player)
-            else:
-                await self.handle_game_over(interaction, player)
-            return
+        else:
+            # Success path
+            success_embed = discord.Embed(
+                title="✅ Success!",
+                description=f"Your roll of {roll} was enough! Moving forward...",
+                color=0x00ff00
+            )
+            await interaction.edit_original_response(embed=success_embed, view=None)
+            await asyncio.sleep(2)
         
-        # Continue with next scene generation...
+        # Generate next scene
+        next_scene = await self.generate_next_scene(
+            player,
+            choice_text,
+            success
+        )
+        player.current_scene = next_scene
+        
+        # Increment scene number ONCE after processing either success or failure
+        player.current_scene_number += 1
+        
+        # Show new scene
+        new_embed = await self.create_game_embed(player)
+        await interaction.edit_original_response(
+            embed=new_embed,
+            view=AdventureView(self, player)
+        )
+
+    async def handle_victory(self, interaction: discord.Interaction, player: Player, final_choice: str):
+        """Handle victory state"""
+        try:
+            victory_scene = await self.generate_victory_scene(player, final_choice)
+            
+            # Create victory embed
+            embed = discord.Embed(
+                title="🎉 Quest Complete: " + player.quest_name,
+                description=victory_scene["description"],
+                color=0x00ff00  # Green for victory
+            )
+            
+            embed.add_field(
+                name="Final Status",
+                value=victory_scene["quest_status"],
+                inline=False
+            )
+            
+            embed.add_field(
+                name="🏆 Reward",
+                value=victory_scene["reward_description"],
+                inline=False
+            )
+            
+            # Add statistics
+            embed.add_field(
+                name="📊 Adventure Summary",
+                value=f"Scenes Completed: {self.MAX_SCENES}/{self.MAX_SCENES}\n"
+                      f"Lives Remaining: {player.lives_remaining}/{player.max_lives}\n"
+                      f"Final Action: {final_choice}",
+                inline=False
+            )
+            
+            await interaction.edit_original_response(
+                embed=embed,
+                view=None
+            )
+            
+            # Clean up game state
+            if interaction.user.id in self.active_games:
+                del self.active_games[interaction.user.id]
+            if interaction.user.id in self.generation_status:
+                del self.generation_status[interaction.user.id]
+            
+        except Exception as e:
+            logger.error(f"Error in handle_victory: {e}")
+            # Still try to clean up game state on error
+            if interaction.user.id in self.active_games:
+                del self.active_games[interaction.user.id]
+            if interaction.user.id in self.generation_status:
+                del self.generation_status[interaction.user.id]
 
 # ---- Discord UI and Bot Commands ----
 
@@ -615,11 +643,7 @@ class AdventureView(discord.ui.View):
 
 class ChoiceButton(discord.ui.Button):
     def __init__(self, index: int, label: str, success_rate: int):
-        super().__init__(
-            style=discord.ButtonStyle.secondary,
-            label=label,
-            custom_id=f"choice_{index}"
-        )
+        super().__init__(style=discord.ButtonStyle.primary, label=label)
         self.success_rate = success_rate
 
     async def callback(self, interaction: discord.Interaction):
@@ -635,205 +659,101 @@ class ChoiceButton(discord.ui.Button):
                 await interaction.response.send_message("This isn't your adventure!", ephemeral=True)
                 return
 
-            # Update button styles immediately
+            # Disable all buttons immediately
             for item in view.children:
                 item.disabled = True
                 if item == self:
-                    item.style = discord.ButtonStyle.success  # Green for chosen
+                    item.style = discord.ButtonStyle.success
                 else:
-                    item.style = discord.ButtonStyle.secondary  # Gray for others
+                    item.style = discord.ButtonStyle.secondary
             
-            # Update the view immediately with the new button styles
             await interaction.response.edit_message(view=view)
             
-            # Log the current state before processing choice
-            logger.info(f"Current scene state:\n{json.dumps(view.player.current_scene, indent=2)}")
-            
-            # Add choice to history
-            view.player.choice_history.append({
-                'scene': view.player.scenes_completed,
-                'choice': self.label,
-                'description': view.player.current_scene["description"]
-            })
-            
-            logger.info(f"Choice history:\n{json.dumps(view.player.choice_history, indent=2)}")
-            
-            logger.info(f"Player {interaction.user.id} chose option: {self.label}")
-            
-            # Generate a thematic processing message
+            # Generate suspense message
             processing_data = await view.game.generate_processing_message(
                 view.player.theme_style,
                 view.player.setting,
                 self.label
             )
             
+            # Show choice processing
             suspense_embed = discord.Embed(
                 title="⏳ " + processing_data["processing_message"],
                 description=f"You chose: {self.label}",
                 color=0xffff00
             )
-            logger.info(f"Sending suspense embed:\n{json.dumps({'title': suspense_embed.title, 'description': suspense_embed.description}, indent=2)}")
             await interaction.edit_original_response(embed=suspense_embed, view=view)
-            await asyncio.sleep(3.5)  # Increased from 2.5
+            await asyncio.sleep(3)
             
+            # Roll for success
             roll = random.randint(1, 100)
-            logger.info(f"Roll: {roll}, Success Rate: {self.success_rate}")
+            success = roll <= self.success_rate
             
+            # Show roll result
             result_embed = discord.Embed(
                 title=processing_data["result_title"],
                 description=f"Required: {self.success_rate} or less\nActual: {roll}",
                 color=0xffff00
             )
-            logger.info(f"Sending roll result embed:\n{json.dumps({'title': result_embed.title, 'description': result_embed.description}, indent=2)}")
             await interaction.edit_original_response(embed=result_embed, view=view)
-            await asyncio.sleep(3)  # Increased from 2
-            
-            success = roll <= self.success_rate
-            view.player.scenes_completed += 1
-            
-            if success:
-                # Check if this was the final successful scene
-                if view.player.scenes_completed >= view.game.MAX_SCENES:
-                    # Generate and show victory scene
-                    victory_scene = await view.game.generate_victory_scene(
-                        view.player,
-                        self.label
-                    )
-                    view.player.current_scene = victory_scene
-                    
-                    final_embed = await view.game.create_game_embed(view.player)
-                    await interaction.edit_original_response(
-                        embed=final_embed,
-                        view=None  # No more choices needed
-                    )
-                    return
-                
-                # Success path
-                success_embed = discord.Embed(
-                    title="✅ Success!",
-                    description=f"Your roll of {roll} was enough! Moving forward...",
-                    color=0x00ff00  # Green
+            await asyncio.sleep(2)
+
+            # Record the choice
+            view.player.choice_history.append({
+                'scene': view.player.current_scene_number,
+                'choice': self.label,
+                'description': view.player.current_scene["description"]
+            })
+
+            # Check if this is the final scene
+            is_final_scene = view.player.current_scene_number >= 5  # Explicit check against 5
+
+            if not success:
+                view.player.lives_remaining -= 1
+                failure_data = await view.game.generate_failure_message(
+                    view.player,
+                    self.label,
+                    roll,
+                    self.success_rate
                 )
-                logger.info(f"Sending success embed:\n{json.dumps({'title': success_embed.title, 'description': success_embed.description}, indent=2)}")
-                await interaction.edit_original_response(embed=success_embed, view=view)
-                await asyncio.sleep(2)
                 
-                # Generate and show next scene
+                if view.player.lives_remaining <= 0 or (is_final_scene and not success):
+                    # Game Over - Either no lives left or failed final scene
+                    await view.game.handle_game_over(interaction, view.player, failure_data["message"])
+                    return
+
+            # Handle victory if succeeded on final scene
+            if is_final_scene and success:
+                await view.game.handle_victory(interaction, view.player, self.label)
+                return
+
+            # Only generate next scene if not final scene
+            if not is_final_scene:
+                # Generate next scene
                 next_scene = await view.game.generate_next_scene(
                     view.player,
                     self.label,
-                    success
+                    success,
+                    failure_data["message"] if not success else None
                 )
-                view.player.current_scene = next_scene
                 
+                # Increment scene number
+                view.player.current_scene_number += 1
+                
+                # Continue to next scene
+                view.player.current_scene = next_scene
                 new_embed = await view.game.create_game_embed(view.player)
                 await interaction.edit_original_response(
                     embed=new_embed,
                     view=AdventureView(view.game, view.player)
                 )
-            else:
-                if view.player.lives_remaining > 1:
-                    # Lose a life but continue with consequences
-                    view.player.lives_remaining -= 1
-                    
-                    failure_data = await view.game.generate_failure_message(
-                        view.player,
-                        self.label,
-                        roll,
-                        self.success_rate
-                    )
-                    
-                    # Show failure message
-                    failure_embed = discord.Embed(
-                        title="💔 Life Lost!",
-                        description=failure_data["message"],
-                        color=0xff7700  # Orange for warning
-                    )
-                    
-                    failure_embed.add_field(
-                        name="Consequence",
-                        value=f"Lives Remaining: {'❤️' * view.player.lives_remaining}\nDealing with the aftermath...",
-                        inline=False
-                    )
-                    
-                    await interaction.edit_original_response(
-                        embed=failure_embed,
-                        view=None
-                    )
-                    
-                    await asyncio.sleep(4)
-                    
-                    # Generate next scene with failure context
-                    next_scene = await view.game.generate_next_scene(
-                        view.player,
-                        self.label,
-                        success,
-                        failure_data["message"]
-                    )
-                    view.player.current_scene = next_scene
-                    view.player.scenes_completed += 1
-                    
-                    # Show new scene
-                    new_embed = await view.game.create_game_embed(view.player)
-                    await interaction.edit_original_response(
-                        embed=new_embed,
-                        view=AdventureView(view.game, view.player)
-                    )
-                    return
-                else:
-                    # No lives left - game over
-                    failure_data = await view.game.generate_failure_message(
-                        view.player,
-                        self.label,
-                        roll,
-                        self.success_rate
-                    )
-                    
-                    final_embed = discord.Embed(
-                        title="💀 Game Over",
-                        color=0xff0000
-                    )
-                    
-                    final_embed.add_field(
-                        name="What Happened",
-                        value=failure_data["message"],
-                        inline=False
-                    )
-                    
-                    final_embed.add_field(
-                        name="─" * 20,
-                        value="",
-                        inline=False
-                    )
-                    
-                    final_embed.add_field(
-                        name="📊 Final Report",
-                        value=f"Scenes Completed: {view.player.scenes_completed}/{view.game.MAX_SCENES}\n"
-                              f"Lives Used: {view.player.max_lives}\n"
-                              f"Final Action: {self.label}",
-                        inline=False
-                    )
-                    
-                    footer_texts = [
-                        "Mission Status: Game Over",
-                        "Operation Status: Terminated",
-                        "Quest Status: Failed",
-                        "Adventure Status: Concluded"
-                    ]
-                    final_embed.set_footer(text=random.choice(footer_texts))
-                    
-                    await interaction.edit_original_response(
-                        embed=final_embed,
-                        view=None
-                    )
-                    return
 
         except Exception as e:
             logger.error(f"Error in button callback: {str(e)}")
-            try:
-                await interaction.followup.send("An error occurred.", ephemeral=True)
-            except:
-                logger.error("Failed to send error message")
+            # Ensure cleanup on error
+            if view.game and interaction.user.id in view.game.active_games:
+                del view.game.active_games[interaction.user.id]
+            session_manager.end_session(interaction.user.id)
 
 def create_error_embed(message: str) -> discord.Embed:
     return discord.Embed(
@@ -848,7 +768,7 @@ def create_location_embed(location: Dict, player: Player) -> discord.Embed:
         description=f"```\n{location['description']}\n```",
         color=0x2f3136
     )
-    embed.set_footer(text=f"Quest: Recover the Forgotten Relic | Scene {player.scenes_completed + 1}")
+    embed.set_footer(text=f"Quest: Recover the Forgotten Relic | Scene {player.current_scene_number}")
     embed.add_field(
         name="📊 Stats",
         value=f"XP: {player.inventory.xp}/{player.inventory.get_next_level_xp()}\nCoins: {player.inventory.coins}",
@@ -1042,7 +962,109 @@ async def cleanup_sessions():
         expired = await session_manager.check_sessions(client)
         if expired:
             logger.info(f"Cleaned up {len(expired)} expired game sessions")
+            
+            # Clean up game states for expired sessions
+            for user_id in expired:
+                if user_id in game.active_games:
+                    del game.active_games[user_id]
+                if user_id in game.generation_status:
+                    del game.generation_status[user_id]
+                    
     except Exception as e:
         logger.error(f"Error in cleanup_sessions: {e}")
+
+@client.tree.command(name="session", description="Check your current game session status")
+async def session_status(interaction: discord.Interaction):
+    """Check the status of your current game session"""
+    try:
+        session = session_manager.get_session(interaction.user.id)
+        if not session:
+            await interaction.response.send_message(
+                "You don't have an active game session.",
+                ephemeral=True
+            )
+            return
+        
+        # Calculate time remaining
+        time_since_interaction = datetime.now() - session.last_interaction
+        time_remaining = timedelta(minutes=session_manager.timeout_minutes) - time_since_interaction
+        
+        embed = discord.Embed(
+            title="Game Session Status",
+            color=0x2f3136
+        )
+        
+        embed.add_field(
+            name="Status",
+            value=session.state.value.title(),
+            inline=True
+        )
+        
+        embed.add_field(
+            name="Time Remaining",
+            value=f"{int(time_remaining.total_seconds() / 60)} minutes",
+            inline=True
+        )
+        
+        if interaction.user.id in game.active_games:
+            player = game.active_games[interaction.user.id]
+            embed.add_field(
+                name="Current Game",
+                value=f"Quest: {player.quest_name}\nScene: {player.current_scene_number}/{game.MAX_SCENES}\nLives: {player.lives_remaining}/{player.max_lives}",
+                inline=False
+            )
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        logger.error(f"Error in session_status command: {e}")
+        await interaction.response.send_message(
+            "An error occurred while checking your session status.",
+            ephemeral=True
+        )
+
+@client.tree.command(name="end", description="End your current game session")
+@app_commands.guild_only()  # Optional: restrict to guilds only
+async def end(interaction: discord.Interaction):
+    """End the current game session"""
+    try:
+        session = session_manager.get_session(interaction.user.id)
+        if not session:
+            await interaction.response.send_message(
+                "You don't have an active game session.",
+                ephemeral=True
+            )
+            return
+        
+        # End the session
+        session_manager.end_session(interaction.user.id)
+        
+        # Clean up game state if it exists
+        if interaction.user.id in game.active_games:
+            del game.active_games[interaction.user.id]
+        if interaction.user.id in game.generation_status:
+            del game.generation_status[interaction.user.id]
+        
+        await interaction.response.send_message(
+            "Your game session has been ended. Use `/start` to begin a new adventure!",
+            ephemeral=True
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in end command: {e}")
+        await interaction.response.send_message(
+            "An error occurred while ending your session.",
+            ephemeral=True
+        )
+
+# Make sure to sync commands on startup
+@client.event
+async def on_ready():
+    try:
+        await client.tree.sync()
+        logger.info(f'Logged in as {client.user} (ID: {client.user.id})')
+        logger.info('------')
+    except Exception as e:
+        logger.error(f"Error syncing commands: {e}")
 
 client.run(os.getenv('DISCORD_TOKEN'))
